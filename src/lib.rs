@@ -17,7 +17,7 @@ use std::{
 };
 use std::{
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{Debug, Formatter},
 };
 
@@ -640,6 +640,11 @@ pub struct PChunk<A: AsRef<str>> {
     // bnode object count -- we need to know how many times a bnode appears as an object
     // because if it occurs more than once we cannot elide it
     bnode_object_count: HashMap<PBlankNode<A>, usize>,
+    // Logical-removal set keyed by (subject, is_seq). `remove` used to do a
+    // linear `position` scan over `v` (O(n)) per blank-node elision, making the
+    // writer O(n^2) on large ontologies. We instead mark (subject, kind) here
+    // and skip it when popped — O(1), byte-identical output.
+    removed: HashSet<(PNamedOrBlankNode<A>, bool)>,
 }
 
 impl<A> PChunk<A>
@@ -715,10 +720,22 @@ where
             v: etv,
             by_sub: HashMap::new(),
             bnode_object_count,
+            removed: HashSet::new(),
         };
         chk.subject_reindex();
 
         chk
+    }
+
+    /// Key identifying an expanded triple for logical removal: its subject plus
+    /// whether it is a sequence (a subject may carry one multi and one seq).
+    fn removal_key(et: &PExpandedTriple<A>) -> (PNamedOrBlankNode<A>, bool) {
+        (et.subject().clone(), matches!(et, PExpandedTriple::PTripleSeq(_)))
+    }
+
+    /// Whether `et` has been logically removed (already rendered inline).
+    fn is_removed(&self, et: &PExpandedTriple<A>) -> bool {
+        self.removed.contains(&Self::removal_key(et))
     }
 
     // Associated function rather than method to work around partial move issues
@@ -759,6 +776,7 @@ where
             v: vec![].into(),
             by_sub: HashMap::new(),
             bnode_object_count: HashMap::new(),
+            removed: HashSet::new(),
         }
     }
 
@@ -787,6 +805,11 @@ where
     pub fn accept_or_push_back(&mut self, t: PTriple<A>) {
         let mut t = t;
         for i in self.v.iter_mut() {
+            // Skip logically-removed entries (rendered inline); merging a triple
+            // into one would lose it.
+            if self.removed.contains(&Self::removal_key(i)) {
+                continue;
+            }
             if let Some(t1) = i.accept(t) {
                 t = t1;
             } else {
@@ -799,6 +822,9 @@ where
     }
 
     pub fn push_back(&mut self, et: PExpandedTriple<A>) {
+        // A fresh entry resurrects this (subject, kind): clear any stale
+        // logical-removal marker so it is rendered rather than skipped.
+        self.removed.remove(&Self::removal_key(&et));
         Self::subject_insert(&mut self.by_sub, &et);
         self.v.push_back(et);
     }
@@ -812,10 +838,11 @@ where
     }
 
     fn remove(&mut self, et: &PExpandedTriple<A>) {
-        if let Some(pos) = self.v.iter().position(|n| n == et) {
-            self.v.remove(pos);
-            self.subject_remove(et)
-        }
+        // Logical removal (O(1)): mark (subject, kind) removed instead of an
+        // O(n) `position` scan over `v`. The entry stays physically in `v` and
+        // is skipped by `format_chunk` when popped (see `is_removed`).
+        self.removed.insert(Self::removal_key(et));
+        self.subject_remove(et)
     }
 
     fn find_subject(
@@ -987,12 +1014,7 @@ where
         let description_open = if let Some(typ) = mt.find_typed() {
             if let PTerm::NamedNode(ref nn) = &typ.object {
                 triples_rendered.push(typ);
-                let mut bs = self.bytes_start_iri(nn);
-                if let PNamedOrBlankNode::BlankNode(ref bn) = &typ.subject {
-                    if chunk.object_count(bn) > 1 {
-                        bs.push_attribute(("rdf:nodeID", bn.as_ref()));
-                    }
-                }
+                let bs = self.bytes_start_iri(nn);
                 Some(bs)
             } else {
                 None
@@ -1008,8 +1030,18 @@ where
             PNamedOrBlankNode::NamedNode(ref n) => {
                 description_open.push_attribute(("rdf:about", n.iri.as_ref()))
             }
-            PNamedOrBlankNode::BlankNode(_) => {
-                // Empty
+            PNamedOrBlankNode::BlankNode(ref bn) => {
+                // A blank-node subject referenced more than once (e.g. a list
+                // head that is both a property-chain value and an
+                // `owl:annotatedTarget`) must be written with an explicit
+                // `rdf:nodeID` so the other references resolve. This applies
+                // whether or not the node carries an `rdf:type` — an untyped
+                // list head (`rdf:first`/`rdf:rest`) otherwise rendered as an
+                // anonymous `rdf:Description`, disconnecting it from its
+                // references.
+                if chunk.object_count(bn) > 1 {
+                    description_open.push_attribute(("rdf:nodeID", bn.as_ref()));
+                }
             }
         }
 
@@ -1021,13 +1053,27 @@ where
                     PLiteral::Simple { value } => {
                         let (iri_protocol_and_host, iri_qname) = literal_t.predicate.split_iri();
 
-                        if let Some(iri_ns_prefix) = &self.config.prefix.get(iri_protocol_and_host)
-                        {
-                            description_open.push_attribute((
-                                &format!("{}:{}", &iri_ns_prefix, &iri_qname)[..],
-                                value.as_ref(),
-                            ));
-                            triples_rendered.push(literal_t);
+                        // XML attribute-value normalization rewrites TAB, LF and
+                        // CR to spaces on re-parse, which silently corrupts any
+                        // literal containing those characters (e.g. multi-line
+                        // definitions). Only use the attribute shorthand when the
+                        // value survives normalization unchanged; otherwise fall
+                        // through and render it later as element text content.
+                        let attr_safe = !value
+                            .as_ref()
+                            .bytes()
+                            .any(|b| b == b'\n' || b == b'\r' || b == b'\t');
+
+                        if attr_safe {
+                            if let Some(iri_ns_prefix) =
+                                &self.config.prefix.get(iri_protocol_and_host)
+                            {
+                                description_open.push_attribute((
+                                    &format!("{}:{}", &iri_ns_prefix, &iri_qname)[..],
+                                    value.as_ref(),
+                                ));
+                                triples_rendered.push(literal_t);
+                            }
                         }
                     }
                     PLiteral::LanguageTaggedString {
@@ -1128,10 +1174,11 @@ where
             PTerm::Literal(l) => {
                 let content = match l {
                     PLiteral::Simple { value } => {
-                        property_open.push_attribute((
-                            "rdf:datatype",
-                            "http://www.w3.org/2001/XMLSchema#string",
-                        ));
+                        // A plain (xsd:string) literal is written WITHOUT an explicit
+                        // `rdf:datatype` — matching OWLAPI/ROBOT's RDF/XML output. An
+                        // explicit `xsd:string` datatype on a nested/reified annotation
+                        // value is not normalized away by ROBOT's structural diff, so
+                        // emitting it would spuriously differ from a fair reference.
                         value
                     }
                     PLiteral::LanguageTaggedString { value, language } => {
@@ -1316,6 +1363,10 @@ where
         loop {
             let optet = chunk.pop_front();
             if let Some(et) = optet {
+                // Skip entries already rendered inline (logically removed).
+                if chunk.is_removed(&et) {
+                    continue;
+                }
                 // If this is a blank node
                 if let PNamedOrBlankNode::BlankNode(bn) = et.subject() {
                     // And there is later triple which will reference this as an object
@@ -1386,6 +1437,19 @@ impl<A: AsRef<str> + Clone + Debug + Eq + Hash, W: Write> RdfFormatter<A, W>
     }
 
     fn finish(mut self) -> Result<W, io::Error> {
+        // Writing an OWL ontology to RDF yields a *set* of triples (the OWLAPI/
+        // ROBOT serialization model). Two distinct OWL axioms can project the
+        // very same RDF statement — most commonly a plain `AnnotationAssertion`
+        // and the base triple of an *annotated* assertion with the same s/p/o
+        // (e.g. ECTO's CHEBI xrefs: a slim import asserts the xref bare while
+        // the full import asserts it with an `oboInOwl:source` annotation).
+        // Emitting that triple twice makes the file re-parse to a spurious extra
+        // un-annotated axiom, since the reification claims only one copy. Drop
+        // exact-duplicate triples (first occurrence wins) so the output matches
+        // ROBOT's. Reification/list triples carry fresh blank nodes and so are
+        // never duplicates; only shared IRI-subject statements collapse.
+        let mut seen = HashSet::with_capacity(self.1.len());
+        self.1.retain(|t| seen.insert(t.clone()));
         let chk = PChunk::normalize(self.1);
         self.0.format_chunk(chk)?;
         self.0.finish()
@@ -1760,7 +1824,7 @@ _:genid3 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/19
 r###"<?xml version="1.0" encoding="UTF-8"?>
 <rdf:RDF xmlns="http://www.example.com/iri#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description rdf:about="http://www.w3.org/TR/rdf-syntax-grammar">
-        <title xmlns="http://purl.org/dc/elements/1.1/" rdf:datatype="http://www.w3.org/2001/XMLSchema#string">RDF1.1 XML Syntax</title>
+        <title xmlns="http://purl.org/dc/elements/1.1/">RDF1.1 XML Syntax</title>
     </rdf:Description>
 </rdf:RDF>"###,
             None
