@@ -11,7 +11,13 @@ license = "LGPL-3.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-indexmap = "1.*"
+# `features = ["std"]` is required, not optional: indexmap 1.x only provides the
+# `RandomState` default hasher (and `IndexMap::new()` / the 2-type-arg form) when
+# its build script sees `CARGO_FEATURE_STD`. indexmap 1.x has no default features,
+# and on a tier-3 target like wasm64-unknown-unknown its fallback autocfg sysroot
+# probe for `std` fails (no prebuilt std), so without this the crate compiles
+# no-std and `IndexMap::new()` disappears.
+indexmap = { version = "1.*", features = ["std"] }
 quick-xml = "0.31.0"
 oxrdf= "0.3.1"
 oxrdfio= "0.2.1"
